@@ -73,6 +73,19 @@ struct RateLimit {
     std::chrono::steady_clock::time_point lastUpdate;
 };
 
+enum class PriorityLevel : int
+{
+    High = 1,
+    Medium = 2,
+    Low = 3
+};
+
+struct PriorityProfile
+{
+    double minKBps = 0.0;   // garantierte Rate
+    double maxKBps = 0.0;   // Kappe für Token Bucket
+};
+
 // ------------------------------------------------------------
 // Hilfsfunktionen (CPU / globales Netzwerk / TCP-States)
 // ------------------------------------------------------------
@@ -416,7 +429,12 @@ public:
     TrafficMonitor()
         : handle_(INVALID_HANDLE_VALUE),
         lastPrint_(std::chrono::steady_clock::now())
-    {}
+    {
+        // Default-Profile: Stufe 1 > 2 > 3
+        priorityProfiles_[PriorityLevel::High] = { 500.0, 500.0 };   // z.B. Spiele / Voice
+        priorityProfiles_[PriorityLevel::Medium] = { 300.0, 300.0 }; // z.B. Browser / Meetings
+        priorityProfiles_[PriorityLevel::Low] = { 100.0, 100.0 };    // Hintergrund-Services
+    }
 
     ~TrafficMonitor() {
         if (handle_ != INVALID_HANDLE_VALUE) {
@@ -486,14 +504,47 @@ public:
         rl.lastUpdate = std::chrono::steady_clock::now();
     }
 
+    void SetPriorityProfile(PriorityLevel level, double minKBps, double maxKBps)
+    {
+        priorityProfiles_[level] = { minKBps, maxKBps };
+
+        // Bereits gesetzte PIDs dieser Stufe direkt aktualisieren
+        for (const auto& [pid, prio] : pidPriority_) {
+            if (prio == level) {
+                ApplyPriorityLimit(pid, prio);
+            }
+        }
+    }
+
+    void SetPriority(DWORD pid, PriorityLevel level)
+    {
+        pidPriority_[pid] = level;
+        ApplyPriorityLimit(pid, level);
+    }
+
 private:
     HANDLE handle_;
     std::unordered_map<ConnKey, DWORD, ConnKeyHash> connToPid_;
     std::unordered_map<DWORD, TrafficCounters>      traffic_;
     std::unordered_map<DWORD, std::wstring>         pidToName_;
     std::unordered_map<DWORD, RateLimit>            limits_;
+    std::unordered_map<DWORD, PriorityLevel>        pidPriority_;
+    std::unordered_map<PriorityLevel, PriorityProfile> priorityProfiles_;
     std::chrono::steady_clock::time_point           lastPrint_;
-   
+
+    void ApplyPriorityLimit(DWORD pid, PriorityLevel level)
+    {
+        auto it = priorityProfiles_.find(level);
+        if (it == priorityProfiles_.end()) {
+            return;
+        }
+
+        // Aktuell nutzen wir min == max als feste Rate pro Stufe
+        // (Token-Bucket garantiert den Wert, bis die Kappe erreicht ist)
+        const PriorityProfile& profile = it->second;
+        SetLimit(pid, profile.maxKBps);
+    }
+
     bool ProcessPacket(const char* packet, UINT recvLen, const WINDIVERT_ADDRESS& addr) {
         // Packet parsen
         PWINDIVERT_IPHDR ip = nullptr;
@@ -585,7 +636,7 @@ private:
             return false;
         }
     }
-
+    
     void PrintStatsIfIntervalElapsed() {
         auto now = std::chrono::steady_clock::now();
         std::chrono::duration<double> diff = now - lastPrint_;
@@ -606,8 +657,15 @@ private:
                 name.assign(w.begin(), w.end()); // einfache Konvertierung
             }
 
+            std::string prioString = "-";
+            auto prioIt = pidPriority_.find(pid);
+            if (prioIt != pidPriority_.end()) {
+                prioString = "P" + std::to_string(static_cast<int>(prioIt->second));
+            }
+
             std::cout << "PID " << pid
                 << " (" << name << ") "
+                << "[" << prioString << "] "
                 << "| Download: " << downKB << " KB/s"
                 << " | Upload: " << upKB << " KB/s"
                 << std::endl;
@@ -634,7 +692,17 @@ int main() {
     if (!monitor.Init()) {
         return 1;
     }
-    //monitor.SetLimit(5876, 50.0);
+
+    // Beispielkonfiguration: Prioritäten und Limits
+    // Stufen nach Wunsch anpassen (KB/s)
+    monitor.SetPriorityProfile(PriorityLevel::High, 0.0, 60000.0);
+    monitor.SetPriorityProfile(PriorityLevel::Medium, 0.0, 30000.0);
+    monitor.SetPriorityProfile(PriorityLevel::Low, 0.0, 10000.0);
+
+    // Konkrete PIDs zuweisen (hier Platzhalter-IDs ersetzen)
+     monitor.SetPriority(13100, PriorityLevel::High);   // z.B. Spiel
+     monitor.SetPriority(12564, PriorityLevel::Medium); // z.B. Browser
+    // monitor.SetPriority(9012, PriorityLevel::Low);    // Hintergrund
 
     monitor.Run();
     return 0;
