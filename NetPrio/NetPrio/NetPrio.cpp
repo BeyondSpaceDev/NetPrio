@@ -600,18 +600,30 @@ private:
 
     bool AllowByPriority(PriorityLevel level, UINT bytes)
     {
+        constexpr double kFullnessThreshold = 1.0; // Höhere Stufen müssen vollständig gefüllt sein
+        constexpr double kEpsilon = 1e-6;           // numerische Toleranz
+
         // Refresh alle Buckets nach Reihenfolge, damit Zeitdifferenzen konsistent sind
         for (PriorityLevel l : priorityOrder_) {
             RefreshPriorityBucket(l);
         }
 
-        // Wenn eine höhere Stufe ihr Guthaben "nicht voll" hat, sind wir ausgelastet und blocken
+        // Wenn eine höhere Stufe ihr Guthaben nicht (nahezu) voll hat, blocken wir
         for (PriorityLevel l : priorityOrder_) {
             if (l == level) break;
 
             RateLimit& higher = priorityBuckets_[l];
-            if (higher.tokens < static_cast<double>(bytes)) {
-                return false; // Höhere Prio verbraucht gerade das Budget
+            if (higher.maxKBps <= 0.0) {
+                continue; // Stufe deaktiviert
+            }
+
+            double rateBytes = higher.maxKBps * 1024.0;
+            double maxTokens = rateBytes;
+            double threshold = maxTokens * kFullnessThreshold;
+
+            // Solange der höherpriorisierte Bucket nicht voll ist, gilt: höher zuerst bedienen
+            if (higher.tokens + kEpsilon < threshold) {
+                return false;
             }
         }
 
