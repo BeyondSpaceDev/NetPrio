@@ -77,7 +77,8 @@ enum class PriorityLevel : int
 {
     High = 1,
     Medium = 2,
-    Low = 3
+    Low = 3,
+    Unspecified = 99
 };
 
 struct PriorityProfile
@@ -434,6 +435,22 @@ public:
         priorityProfiles_[PriorityLevel::High] = { 500.0, 500.0 };   // z.B. Spiele / Voice
         priorityProfiles_[PriorityLevel::Medium] = { 300.0, 300.0 }; // z.B. Browser / Meetings
         priorityProfiles_[PriorityLevel::Low] = { 100.0, 100.0 };    // Hintergrund-Services
+
+        priorityOrder_ = { PriorityLevel::High, PriorityLevel::Medium, PriorityLevel::Low, PriorityLevel::Unspecified };
+
+        // Default-Raten auch als Token-Buckets für die Stufen initialisieren
+        for (auto& [level, profile] : priorityProfiles_) {
+            RateLimit& bucket = priorityBuckets_[level];
+            bucket.maxKBps = profile.maxKBps;
+            bucket.tokens = 0.0;
+            bucket.lastUpdate = std::chrono::steady_clock::now();
+        }
+
+        // Unassigned PIDs hängen an "Unspecified" und werden nur bedient, wenn alle Stufen voll sind
+        RateLimit& unspecifiedBucket = priorityBuckets_[PriorityLevel::Unspecified];
+        unspecifiedBucket.maxKBps = 10'000.0; // großzügiger Standardwert, wird durch Prioritätsgating gebremst
+        unspecifiedBucket.tokens = 0.0;
+        unspecifiedBucket.lastUpdate = std::chrono::steady_clock::now();
     }
 
     ~TrafficMonitor() {
@@ -508,6 +525,11 @@ public:
     {
         priorityProfiles_[level] = { minKBps, maxKBps };
 
+        RateLimit& bucket = priorityBuckets_[level];
+        bucket.maxKBps = maxKBps;
+        bucket.tokens = 0.0;
+        bucket.lastUpdate = std::chrono::steady_clock::now();
+
         // Bereits gesetzte PIDs dieser Stufe direkt aktualisieren
         for (const auto& [pid, prio] : pidPriority_) {
             if (prio == level) {
@@ -529,7 +551,9 @@ private:
     std::unordered_map<DWORD, std::wstring>         pidToName_;
     std::unordered_map<DWORD, RateLimit>            limits_;
     std::unordered_map<DWORD, PriorityLevel>        pidPriority_;
+    std::unordered_map<PriorityLevel, RateLimit>    priorityBuckets_;
     std::unordered_map<PriorityLevel, PriorityProfile> priorityProfiles_;
+    std::vector<PriorityLevel>                      priorityOrder_;
     std::chrono::steady_clock::time_point           lastPrint_;
 
     void ApplyPriorityLimit(DWORD pid, PriorityLevel level)
@@ -543,6 +567,65 @@ private:
         // (Token-Bucket garantiert den Wert, bis die Kappe erreicht ist)
         const PriorityProfile& profile = it->second;
         SetLimit(pid, profile.maxKBps);
+    }
+
+    PriorityLevel GetPriorityForPid(DWORD pid) const
+    {
+        auto it = pidPriority_.find(pid);
+        if (it != pidPriority_.end()) {
+            return it->second;
+        }
+        return PriorityLevel::Unspecified;
+    }
+
+    void RefreshPriorityBucket(PriorityLevel level)
+    {
+        RateLimit& bucket = priorityBuckets_[level];
+        auto now = std::chrono::steady_clock::now();
+        if (bucket.lastUpdate.time_since_epoch().count() == 0) {
+            bucket.lastUpdate = now;
+        }
+
+        double dt = std::chrono::duration<double>(now - bucket.lastUpdate).count();
+        bucket.lastUpdate = now;
+
+        double rateBytes = bucket.maxKBps * 1024.0;
+        bucket.tokens += rateBytes * dt;
+
+        double maxTokens = rateBytes; // ~1s Burst
+        if (bucket.tokens > maxTokens) {
+            bucket.tokens = maxTokens;
+        }
+    }
+
+    bool AllowByPriority(PriorityLevel level, UINT bytes)
+    {
+        // Refresh alle Buckets nach Reihenfolge, damit Zeitdifferenzen konsistent sind
+        for (PriorityLevel l : priorityOrder_) {
+            RefreshPriorityBucket(l);
+        }
+
+        // Wenn eine höhere Stufe ihr Guthaben "nicht voll" hat, sind wir ausgelastet und blocken
+        for (PriorityLevel l : priorityOrder_) {
+            if (l == level) break;
+
+            RateLimit& higher = priorityBuckets_[l];
+            if (higher.tokens < static_cast<double>(bytes)) {
+                return false; // Höhere Prio verbraucht gerade das Budget
+            }
+        }
+
+        RateLimit& current = priorityBuckets_[level];
+        if (current.maxKBps <= 0.0) {
+            return false;
+        }
+
+        if (current.tokens >= static_cast<double>(bytes)) {
+            current.tokens -= bytes; // eigenes Budget verbrauchen
+            return true;
+        }
+
+        return false;
     }
 
     bool ProcessPacket(const char* packet, UINT recvLen, const WINDIVERT_ADDRESS& addr) {
@@ -593,50 +676,49 @@ private:
 
         DWORD pid = it->second;
 
+        PriorityLevel level = GetPriorityForPid(pid);
+
         // Statistiken (wie bisher)
         if (addr.Outbound)
             traffic_[pid].upload += recvLen;
         else
             traffic_[pid].download += recvLen;
 
-        // --- Rate-Limit prüfen ---
+        // Zuerst Prioritätskette: niedrigere Stufen dürfen nur senden, wenn alle höheren "voll" sind
+        if (!AllowByPriority(level, recvLen)) {
+            return false;
+        }
+
+        // Optional: PID-spezifische Kappe (z.B. um Prozesse innerhalb einer Stufe zu begrenzen)
         auto limIt = limits_.find(pid);
         if (limIt == limits_.end()) {
-            // kein Limit gesetzt -> alles durchlassen
-            return true;
+            return true; // kein per-PID-Limit gesetzt
         }
 
         RateLimit& rl = limIt->second;
         if (rl.maxKBps <= 0.0) {
-            // 0 oder negativ -> komplett blocken
-            return false; // Paket droppen
+            return false; // explizit blockiert
         }
 
-        // Token-Bucket updaten
         auto now = std::chrono::steady_clock::now();
         double dt = std::chrono::duration<double>(now - rl.lastUpdate).count();
         rl.lastUpdate = now;
 
-        // Rate in Bytes/s
         double rateBytes = rl.maxKBps * 1024.0;
         rl.tokens += rateBytes * dt;
 
-        // Optional: Burst-Begrenzung, z.B. 1 Sekunde Puffer
         double maxTokens = rateBytes;
         if (rl.tokens > maxTokens)
             rl.tokens = maxTokens;
 
-        // Reicht das Guthaben für dieses Paket?
         if (rl.tokens >= (double)recvLen) {
             rl.tokens -= recvLen;
-            return true;   // senden
+            return true;
         }
-        else {
-            // Limit erreicht: Paket droppen
-            return false;
-        }
+
+        return false;
     }
-    
+
     void PrintStatsIfIntervalElapsed() {
         auto now = std::chrono::steady_clock::now();
         std::chrono::duration<double> diff = now - lastPrint_;
@@ -657,11 +739,10 @@ private:
                 name.assign(w.begin(), w.end()); // einfache Konvertierung
             }
 
-            std::string prioString = "-";
-            auto prioIt = pidPriority_.find(pid);
-            if (prioIt != pidPriority_.end()) {
-                prioString = "P" + std::to_string(static_cast<int>(prioIt->second));
-            }
+            PriorityLevel level = GetPriorityForPid(pid);
+            std::string prioString = (level == PriorityLevel::Unspecified)
+                ? "-"
+                : "P" + std::to_string(static_cast<int>(level));
 
             std::cout << "PID " << pid
                 << " (" << name << ") "
@@ -694,14 +775,15 @@ int main() {
     }
 
     // Beispielkonfiguration: Prioritäten und Limits
-    // Stufen nach Wunsch anpassen (KB/s)
+    // Stufen nach Wunsch anpassen (KB/s). Niedrigere Stufen werden nur bedient,
+    // wenn alle höheren Token-Buckets voll sind (Top-Down-Hierarchie).
     monitor.SetPriorityProfile(PriorityLevel::High, 0.0, 60000.0);
     monitor.SetPriorityProfile(PriorityLevel::Medium, 0.0, 30000.0);
     monitor.SetPriorityProfile(PriorityLevel::Low, 0.0, 10000.0);
 
     // Konkrete PIDs zuweisen (hier Platzhalter-IDs ersetzen)
-     monitor.SetPriority(13100, PriorityLevel::High);   // z.B. Spiel
-     monitor.SetPriority(12564, PriorityLevel::Medium); // z.B. Browser
+     monitor.SetPriority(12564, PriorityLevel::High);   // z.B. Spiel
+     monitor.SetPriority(13100, PriorityLevel::Medium); // z.B. Browser
     // monitor.SetPriority(9012, PriorityLevel::Low);    // Hintergrund
 
     monitor.Run();
