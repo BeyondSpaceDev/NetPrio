@@ -175,7 +175,7 @@ void ListTcpConnectionsByProcess(const std::unordered_map<DWORD, std::wstring>& 
         return;
     }
 
-    std::wcout << L"\nTCP-Verbindungen (IPv4) nach Prozess:\n\n";
+    std::wcout << L"\nVerbindungen (TCP, IPv4) nach Prozess:\n\n";
 
     for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
         const MIB_TCPROW_OWNER_PID& row = pTable->table[i];
@@ -239,63 +239,126 @@ std::unordered_map<DWORD, std::wstring> BuildPidNameMap() {
     return pidToName;
 }
 
-// Mapping TCP-Verbindung -> PID
-bool BuildTcpConnectionPidMap(
+// Mapping TCP/UDP-Verbindung -> PID
+bool BuildConnectionPidMap(
     std::unordered_map<ConnKey, DWORD, ConnKeyHash>& connToPid)
 {
     connToPid.clear();
 
-    DWORD size = 0;
-    DWORD result = GetExtendedTcpTable(
-        nullptr,
-        &size,
-        TRUE,                        // sortiert
-        AF_INET,                     // IPv4
-        TCP_TABLE_OWNER_PID_ALL,
-        0
-    );
+    auto insertConn = [&connToPid](const ConnKey& key, DWORD pid) {
+        connToPid[key] = pid;
+        };
 
-    if (result != ERROR_INSUFFICIENT_BUFFER) {
-        std::cerr << "GetExtendedTcpTable (size) failed: " << result << "\n";
-        return false;
-    }
+    // --- TCP ---
+    {
+        DWORD size = 0;
+        DWORD result = GetExtendedTcpTable(
+            nullptr,
+            &size,
+            TRUE,                        // sortiert
+            AF_INET,                     // IPv4
+            TCP_TABLE_OWNER_PID_ALL,
+            0
+        );
 
-    PMIB_TCPTABLE_OWNER_PID pTable =
-        (PMIB_TCPTABLE_OWNER_PID)malloc(size);
-    if (!pTable) {
-        std::cerr << "malloc failed\n";
-        return false;
-    }
+        if (result != ERROR_INSUFFICIENT_BUFFER) {
+            std::cerr << "GetExtendedTcpTable (size) failed: " << result << "\n";
+            return false;
+        }
 
-    result = GetExtendedTcpTable(
-        pTable,
-        &size,
-        TRUE,
-        AF_INET,
-        TCP_TABLE_OWNER_PID_ALL,
-        0
-    );
+        PMIB_TCPTABLE_OWNER_PID pTable =
+            (PMIB_TCPTABLE_OWNER_PID)malloc(size);
+        if (!pTable) {
+            std::cerr << "malloc failed\n";
+            return false;
+        }
 
-    if (result != NO_ERROR) {
-        std::cerr << "GetExtendedTcpTable failed: " << result << "\n";
+        result = GetExtendedTcpTable(
+            pTable,
+            &size,
+            TRUE,
+            AF_INET,
+            TCP_TABLE_OWNER_PID_ALL,
+            0
+        );
+
+        if (result != NO_ERROR) {
+            std::cerr << "GetExtendedTcpTable failed: " << result << "\n";
+            free(pTable);
+            return false;
+        }
+
+        for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+            const MIB_TCPROW_OWNER_PID& row = pTable->table[i];
+
+            ConnKey key{};
+            key.localAddr = row.dwLocalAddr;      // schon in Network-Order
+            key.remoteAddr = row.dwRemoteAddr;
+            key.localPort = ntohs((u_short)row.dwLocalPort);
+            key.remotePort = ntohs((u_short)row.dwRemotePort);
+            key.protocol = IPPROTO_TCP;
+
+            insertConn(key, row.dwOwningPid);
+        }
+
         free(pTable);
-        return false;
     }
 
-    for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
-        const MIB_TCPROW_OWNER_PID& row = pTable->table[i];
+    // --- UDP (für QUIC / Streaming wichtig) ---
+    {
+        DWORD size = 0;
+        DWORD result = GetExtendedUdpTable(
+            nullptr,
+            &size,
+            TRUE,
+            AF_INET,
+            UDP_TABLE_OWNER_PID,
+            0
+        );
 
-        ConnKey key{};
-        key.localAddr = row.dwLocalAddr;      // schon in Network-Order
-        key.remoteAddr = row.dwRemoteAddr;
-        key.localPort = ntohs((u_short)row.dwLocalPort);
-        key.remotePort = ntohs((u_short)row.dwRemotePort);
-        key.protocol = IPPROTO_TCP;
+        if (result != ERROR_INSUFFICIENT_BUFFER) {
+            std::cerr << "GetExtendedUdpTable (size) failed: " << result << "\n";
+            return false;
+        }
 
-        connToPid[key] = row.dwOwningPid;
+        PMIB_UDPTABLE_OWNER_PID pTable =
+            (PMIB_UDPTABLE_OWNER_PID)malloc(size);
+        if (!pTable) {
+            std::cerr << "malloc failed\n";
+            return false;
+        }
+
+        result = GetExtendedUdpTable(
+            pTable,
+            &size,
+            TRUE,
+            AF_INET,
+            UDP_TABLE_OWNER_PID,
+            0
+        );
+
+        if (result != NO_ERROR) {
+            std::cerr << "GetExtendedUdpTable failed: " << result << "\n";
+            free(pTable);
+            return false;
+        }
+
+        for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
+            const MIB_UDPROW_OWNER_PID& row = pTable->table[i];
+
+            ConnKey key{};
+            key.localAddr = row.dwLocalAddr;
+            key.remoteAddr = 0; // UDP-Tabelle enthält keine Remote-Daten
+            key.localPort = ntohs((u_short)row.dwLocalPort);
+            key.remotePort = 0;
+            key.protocol = IPPROTO_UDP;
+
+            insertConn(key, row.dwOwningPid);
+        }
+
+        free(pTable);
     }
 
-    free(pTable);
     return true;
 }
 
@@ -460,7 +523,7 @@ public:
     }
 
     bool Init() {
-        if (!BuildTcpConnectionPidMap(connToPid_)) {
+        if (!BuildConnectionPidMap(connToPid_)) {
             std::cerr << "Konnte Connection-PID-Map nicht erstellen.\n";
             return false;
         }
@@ -468,7 +531,7 @@ public:
         pidToName_ = BuildPidNameMap();
 
         handle_ = WinDivertOpen(
-            "ip and tcp",                  // Filter: alle TCP IPv4 Pakete
+            "ip and (tcp or udp)",         // Filter: alle IP-Pakete mit TCP/UDP (inkl. QUIC)
             WINDIVERT_LAYER_NETWORK,
             0,                             // Priority
             0           // originaler Traffic geht normal weiter ,vorher WINDIVERT_FLAG_SNIFF jetzt 0
@@ -479,7 +542,7 @@ public:
         }
 
         std::cout << "Connection-PID-Map aufgebaut: "
-            << connToPid_.size() << " TCP-Verbindungen.\n";
+            << connToPid_.size() << " Verbindungen (TCP+UDP).\n";
 
         lastPrint_ = std::chrono::steady_clock::now();
         return true;
@@ -660,8 +723,15 @@ private:
             return true; // unparsbar -> einfach durchlassen
         }
 
-        // Wir wollen nur IPv4 + TCP limitieren
-        if (!ip || !tcp || protocol != IPPROTO_TCP)
+        // Wir wollen IPv4 + TCP/UDP limitieren (UDP für QUIC/Streaming)
+        const bool isTcp = (protocol == IPPROTO_TCP);
+        const bool isUdp = (protocol == IPPROTO_UDP);
+
+        if (!ip || (!isTcp && !isUdp))
+            return true;
+        if (isTcp && !tcp)
+            return true;
+        if (isUdp && !udp)
             return true;
 
         // Richtung beachten
@@ -669,18 +739,27 @@ private:
         if (addr.Outbound) {
             key.localAddr = ip->SrcAddr;
             key.remoteAddr = ip->DstAddr;
-            key.localPort = ntohs(tcp->SrcPort);
-            key.remotePort = ntohs(tcp->DstPort);
+            key.localPort = ntohs(isTcp ? tcp->SrcPort : udp->SrcPort);
+            key.remotePort = ntohs(isTcp ? tcp->DstPort : udp->DstPort);
         }
         else { // inbound
             key.localAddr = ip->DstAddr;
             key.remoteAddr = ip->SrcAddr;
-            key.localPort = ntohs(tcp->DstPort);
-            key.remotePort = ntohs(tcp->SrcPort);
+            key.localPort = ntohs(isTcp ? tcp->DstPort : udp->DstPort);
+            key.remotePort = ntohs(isTcp ? tcp->SrcPort : udp->SrcPort);
         }
-        key.protocol = IPPROTO_TCP;
+        key.protocol = isTcp ? IPPROTO_TCP : IPPROTO_UDP;
 
         auto it = connToPid_.find(key);
+
+        // Fallback für UDP ohne Remote-Felder: match nur über localAddr/Port
+        if (it == connToPid_.end() && protocol == IPPROTO_UDP) {
+            ConnKey udpLocalOnly = key;
+            udpLocalOnly.remoteAddr = 0;
+            udpLocalOnly.remotePort = 0;
+            it = connToPid_.find(udpLocalOnly);
+        }
+
         if (it == connToPid_.end()) {
             // keine Zuordnung -> nicht limitieren
             return true;
@@ -768,7 +847,7 @@ private:
         lastPrint_ = now;
 
         // Map gelegentlich aktualisieren (für neue Verbindungen / Prozesse)
-        BuildTcpConnectionPidMap(connToPid_);
+        BuildConnectionPidMap(connToPid_);
         pidToName_ = BuildPidNameMap();
     }
 };
@@ -794,8 +873,8 @@ int main() {
     monitor.SetPriorityProfile(PriorityLevel::Low, 0.0, 10000.0);
 
     // Konkrete PIDs zuweisen (hier Platzhalter-IDs ersetzen)
-     monitor.SetPriority(12564, PriorityLevel::High);   // z.B. Spiel
-     monitor.SetPriority(13100, PriorityLevel::Medium); // z.B. Browser
+    monitor.SetPriority(12564, PriorityLevel::High);   // z.B. Spiel
+    monitor.SetPriority(13100, PriorityLevel::Medium); // z.B. Browser
     // monitor.SetPriority(9012, PriorityLevel::Low);    // Hintergrund
 
     monitor.Run();
