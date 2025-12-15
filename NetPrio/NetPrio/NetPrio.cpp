@@ -11,12 +11,18 @@
 #include <unordered_map>
 #include <iomanip>
 #include <string>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include <iphlpapi.h>
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
 
 #include "windivert.h"
+#include "json.hpp"   // nlohmann::json (Single-Header)
+
+using json = nlohmann::json;
 
 // ------------------------------------------------------------
 // Grunddatenstrukturen
@@ -87,11 +93,22 @@ struct PriorityProfile
     double maxKBps = 0.0;   // Kappe für Token Bucket
 };
 
+// Vorwärtsdeklaration TrafficMonitor für Socket-Handling
+class TrafficMonitor;
+
 // ------------------------------------------------------------
-// Hilfsfunktionen (CPU / globales Netzwerk / TCP-States)
+// Globale Variablen für Socket-Kommunikation
 // ------------------------------------------------------------
 
-// FILETIME -> 64-bit (100ns-Einheiten)
+static SOCKET g_clientSocket = INVALID_SOCKET;
+static std::mutex g_clientMutex;
+static std::atomic_bool g_running(true);
+static TrafficMonitor* g_monitor = nullptr;
+
+// Vorwärtsdeklaration
+void HandleJsonCommand(const std::string& line);
+
+// Hilfsfunktion: FILETIME -> 64-bit (100ns-Einheiten)
 static unsigned long long FileTimeToUInt64(const FILETIME& ft) {
     ULARGE_INTEGER li;
     li.LowPart = ft.dwLowDateTime;
@@ -120,10 +137,6 @@ NetStats GetTotalNetworkBytes() {
 
     for (DWORD i = 0; i < pTable->dwNumEntries; ++i) {
         MIB_IFROW& row = pTable->table[i];
-
-        // Loopback könnte man rausfiltern, wenn man will:
-        // if (row.dwType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
-
         stats.inBytes += row.dwInOctets;
         stats.outBytes += row.dwOutOctets;
     }
@@ -151,7 +164,104 @@ std::wstring TcpStateToString(DWORD state) {
 }
 
 // ------------------------------------------------------------
-// Prozess-/TCP-Hilfen (Task-Manager-artige Funktionen)
+// Socket-Hilfsfunktionen
+// ------------------------------------------------------------
+
+void SendJsonLine(const std::string& line) {
+    std::lock_guard<std::mutex> lock(g_clientMutex);
+    if (g_clientSocket == INVALID_SOCKET) return;
+    std::string msg = line + "\n";
+    send(g_clientSocket, msg.c_str(), (int)msg.size(), 0);
+}
+
+void HandleClientCommands(SOCKET client) {
+    char buffer[4096];
+    std::string pending;
+
+    while (true) {
+        int n = recv(client, buffer, sizeof(buffer), 0);
+        if (n <= 0) break;
+        pending.append(buffer, n);
+
+        size_t pos;
+        while ((pos = pending.find('\n')) != std::string::npos) {
+            std::string line = pending.substr(0, pos);
+            pending.erase(0, pos + 1);
+            if (!line.empty()) {
+                HandleJsonCommand(line);
+            }
+        }
+    }
+
+    closesocket(client);
+    {
+        std::lock_guard<std::mutex> lock(g_clientMutex);
+        if (g_clientSocket == client) {
+            g_clientSocket = INVALID_SOCKET;
+        }
+    }
+    std::cout << "GUI getrennt\n";
+}
+
+void ServerThreadFunc() {
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        std::cerr << "WSAStartup failed\n";
+        return;
+    }
+
+    SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock == INVALID_SOCKET) {
+        std::cerr << "socket() failed\n";
+        WSACleanup();
+        return;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+    addr.sin_port = htons(5555);
+
+    if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR) {
+        std::cerr << "bind() failed\n";
+        closesocket(listenSock);
+        WSACleanup();
+        return;
+    }
+
+    if (listen(listenSock, 1) == SOCKET_ERROR) {
+        std::cerr << "listen() failed\n";
+        closesocket(listenSock);
+        WSACleanup();
+        return;
+    }
+
+    std::cout << "TCP-Server lauscht auf 127.0.0.1:5555 (GUI-Client)...\n";
+
+    while (g_running) {
+        SOCKET client = accept(listenSock, nullptr, nullptr);
+        if (client == INVALID_SOCKET) {
+            if (!g_running) break;
+            std::cerr << "accept() failed\n";
+            break;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_clientMutex);
+            g_clientSocket = client;
+        }
+        std::cout << "GUI verbunden\n";
+
+        std::thread recvThread(HandleClientCommands, client);
+        recvThread.detach();
+    }
+
+    closesocket(listenSock);
+    WSACleanup();
+}
+
+// ------------------------------------------------------------
+// Prozess-/TCP-Hilfen
 // ------------------------------------------------------------
 
 void ListTcpConnectionsByProcess(const std::unordered_map<DWORD, std::wstring>& pidToName) {
@@ -255,8 +365,8 @@ bool BuildConnectionPidMap(
         DWORD result = GetExtendedTcpTable(
             nullptr,
             &size,
-            TRUE,                        // sortiert
-            AF_INET,                     // IPv4
+            TRUE,
+            AF_INET,
             TCP_TABLE_OWNER_PID_ALL,
             0
         );
@@ -292,7 +402,7 @@ bool BuildConnectionPidMap(
             const MIB_TCPROW_OWNER_PID& row = pTable->table[i];
 
             ConnKey key{};
-            key.localAddr = row.dwLocalAddr;      // schon in Network-Order
+            key.localAddr = row.dwLocalAddr;
             key.remoteAddr = row.dwRemoteAddr;
             key.localPort = ntohs((u_short)row.dwLocalPort);
             key.remotePort = ntohs((u_short)row.dwRemotePort);
@@ -304,7 +414,7 @@ bool BuildConnectionPidMap(
         free(pTable);
     }
 
-    // --- UDP (für QUIC / Streaming wichtig) ---
+    // --- UDP ---
     {
         DWORD size = 0;
         DWORD result = GetExtendedUdpTable(
@@ -348,7 +458,7 @@ bool BuildConnectionPidMap(
 
             ConnKey key{};
             key.localAddr = row.dwLocalAddr;
-            key.remoteAddr = 0; // UDP-Tabelle enthält keine Remote-Daten
+            key.remoteAddr = 0;
             key.localPort = ntohs((u_short)row.dwLocalPort);
             key.remotePort = 0;
             key.protocol = IPPROTO_UDP;
@@ -363,8 +473,7 @@ bool BuildConnectionPidMap(
 }
 
 // ------------------------------------------------------------
-// Optional: Task-Manager-artige CPU/Netzwerk-Übersicht
-// (du kannst das bei Bedarf aus main() aufrufen)
+// Optional: Task-Manager-artige Übersicht (unverändert)
 // ------------------------------------------------------------
 
 int calculateTaskManagerState()
@@ -445,10 +554,10 @@ int calculateTaskManagerState()
             unsigned long long cpuNow = tKernel + tUser;
             unsigned long long cpuPrev = it->second;
 
-            unsigned long long delta = cpuNow - cpuPrev; // 100ns-Einheiten
+            unsigned long long delta = cpuNow - cpuPrev;
 
             const double intervalSeconds = 1.0;
-            const double ticksPerSecond = 10'000'000.0; // 100ns -> 1s
+            const double ticksPerSecond = 10'000'000.0;
 
             double cpu = (delta / (ticksPerSecond * intervalSeconds * numCpus)) * 100.0;
             p.cpuPercent = cpu;
@@ -484,7 +593,7 @@ int calculateTaskManagerState()
 }
 
 // ------------------------------------------------------------
-// TrafficMonitor-Klasse (WinDivert + Traffic pro Prozess)
+// TrafficMonitor-Klasse
 // ------------------------------------------------------------
 
 class TrafficMonitor
@@ -494,14 +603,16 @@ public:
         : handle_(INVALID_HANDLE_VALUE),
         lastPrint_(std::chrono::steady_clock::now())
     {
-        // Default-Profile: Stufe 1 > 2 > 3
-        priorityProfiles_[PriorityLevel::High] = { 500.0, 500.0 };   // z.B. Spiele / Voice
-        priorityProfiles_[PriorityLevel::Medium] = { 300.0, 300.0 }; // z.B. Browser / Meetings
-        priorityProfiles_[PriorityLevel::Low] = { 100.0, 100.0 };    // Hintergrund-Services
+        priorityProfiles_[PriorityLevel::High] = { 500.0, 500.0 };
+        priorityProfiles_[PriorityLevel::Medium] = { 300.0, 300.0 };
+        priorityProfiles_[PriorityLevel::Low] = { 100.0, 100.0 };
 
-        priorityOrder_ = { PriorityLevel::High, PriorityLevel::Medium, PriorityLevel::Low, PriorityLevel::Unspecified };
+        priorityOrder_ = { PriorityLevel::High,
+                           PriorityLevel::Medium,
+                           PriorityLevel::Low,
+                           PriorityLevel::Unspecified };
 
-        // Default-Raten auch als Token-Buckets für die Stufen initialisieren
+        // Bucket für jede Stufe
         for (auto& [level, profile] : priorityProfiles_) {
             RateLimit& bucket = priorityBuckets_[level];
             bucket.maxKBps = profile.maxKBps;
@@ -509,9 +620,9 @@ public:
             bucket.lastUpdate = std::chrono::steady_clock::now();
         }
 
-        // Unassigned PIDs hängen an "Unspecified" und werden nur bedient, wenn alle Stufen voll sind
+        // Unspecified
         RateLimit& unspecifiedBucket = priorityBuckets_[PriorityLevel::Unspecified];
-        unspecifiedBucket.maxKBps = 10'000.0; // großzügiger Standardwert, wird durch Prioritätsgating gebremst
+        unspecifiedBucket.maxKBps = 10'000.0;
         unspecifiedBucket.tokens = 0.0;
         unspecifiedBucket.lastUpdate = std::chrono::steady_clock::now();
     }
@@ -531,10 +642,10 @@ public:
         pidToName_ = BuildPidNameMap();
 
         handle_ = WinDivertOpen(
-            "ip and (tcp or udp)",         // Filter: alle IP-Pakete mit TCP/UDP (inkl. QUIC)
+            "ip and (tcp or udp)",
             WINDIVERT_LAYER_NETWORK,
-            0,                             // Priority
-            0           // originaler Traffic geht normal weiter ,vorher WINDIVERT_FLAG_SNIFF jetzt 0
+            0,
+            0
         );
         if (handle_ == INVALID_HANDLE_VALUE) {
             std::cerr << "WinDivertOpen failed: " << GetLastError() << "\n";
@@ -563,14 +674,9 @@ public:
             bool allow = ProcessPacket(packet, recvLen, addr);
 
             if (allow) {
-                // Paket wieder ins System einspeisen
                 if (!WinDivertSend(handle_, packet, recvLen, nullptr, &addr)) {
                     std::cerr << "WinDivertSend failed: " << GetLastError() << "\n";
                 }
-            }
-            else {
-                // gedroppt -> nichts tun
-                // (TCP wird das als Paketverlust sehen und ggf. neu senden)
             }
 
             PrintStatsIfIntervalElapsed();
@@ -593,7 +699,7 @@ public:
         bucket.tokens = 0.0;
         bucket.lastUpdate = std::chrono::steady_clock::now();
 
-        // Bereits gesetzte PIDs dieser Stufe direkt aktualisieren
+        // bereits gesetzte PIDs dieser Stufe aktualisieren
         for (const auto& [pid, prio] : pidPriority_) {
             if (prio == level) {
                 ApplyPriorityLimit(pid, prio);
@@ -601,10 +707,13 @@ public:
         }
     }
 
+    // wird direkt von der GUI über SET_PRIORITIES angesteuert
     void SetPriority(DWORD pid, PriorityLevel level)
     {
         pidPriority_[pid] = level;
         ApplyPriorityLimit(pid, level);
+        std::cout << "SetPriority: PID=" << pid
+            << " Level=" << static_cast<int>(level) << "\n";
     }
 
 private:
@@ -625,9 +734,6 @@ private:
         if (it == priorityProfiles_.end()) {
             return;
         }
-
-        // Aktuell nutzen wir min == max als feste Rate pro Stufe
-        // (Token-Bucket garantiert den Wert, bis die Kappe erreicht ist)
         const PriorityProfile& profile = it->second;
         SetLimit(pid, profile.maxKBps);
     }
@@ -655,7 +761,7 @@ private:
         double rateBytes = bucket.maxKBps * 1024.0;
         bucket.tokens += rateBytes * dt;
 
-        double maxTokens = rateBytes; // ~1s Burst
+        double maxTokens = rateBytes;
         if (bucket.tokens > maxTokens) {
             bucket.tokens = maxTokens;
         }
@@ -663,28 +769,27 @@ private:
 
     bool AllowByPriority(PriorityLevel level, UINT bytes)
     {
-        constexpr double kFullnessThreshold = 1.0; // Höhere Stufen müssen vollständig gefüllt sein
-        constexpr double kEpsilon = 1e-6;           // numerische Toleranz
+        constexpr double kFullnessThreshold = 1.0;
+        constexpr double kEpsilon = 1e-6;
 
-        // Refresh alle Buckets nach Reihenfolge, damit Zeitdifferenzen konsistent sind
+        // alle Buckets refreshen
         for (PriorityLevel l : priorityOrder_) {
             RefreshPriorityBucket(l);
         }
 
-        // Wenn eine höhere Stufe ihr Guthaben nicht (nahezu) voll hat, blocken wir
+        // solange höhere Stufen nicht "voll" sind, blocken wir niedrigere
         for (PriorityLevel l : priorityOrder_) {
             if (l == level) break;
 
             RateLimit& higher = priorityBuckets_[l];
             if (higher.maxKBps <= 0.0) {
-                continue; // Stufe deaktiviert
+                continue;
             }
 
             double rateBytes = higher.maxKBps * 1024.0;
             double maxTokens = rateBytes;
             double threshold = maxTokens * kFullnessThreshold;
 
-            // Solange der höherpriorisierte Bucket nicht voll ist, gilt: höher zuerst bedienen
             if (higher.tokens + kEpsilon < threshold) {
                 return false;
             }
@@ -696,7 +801,7 @@ private:
         }
 
         if (current.tokens >= static_cast<double>(bytes)) {
-            current.tokens -= bytes; // eigenes Budget verbrauchen
+            current.tokens -= bytes;
             return true;
         }
 
@@ -704,7 +809,6 @@ private:
     }
 
     bool ProcessPacket(const char* packet, UINT recvLen, const WINDIVERT_ADDRESS& addr) {
-        // Packet parsen
         PWINDIVERT_IPHDR ip = nullptr;
         PWINDIVERT_IPV6HDR ipv6 = nullptr;
         UINT8 protocol = 0;
@@ -720,10 +824,9 @@ private:
             &tcp, &udp,
             &data, &dataLen,
             nullptr, nullptr)) {
-            return true; // unparsbar -> einfach durchlassen
+            return true;
         }
 
-        // Wir wollen IPv4 + TCP/UDP limitieren (UDP für QUIC/Streaming)
         const bool isTcp = (protocol == IPPROTO_TCP);
         const bool isUdp = (protocol == IPPROTO_UDP);
 
@@ -734,7 +837,6 @@ private:
         if (isUdp && !udp)
             return true;
 
-        // Richtung beachten
         ConnKey key{};
         if (addr.Outbound) {
             key.localAddr = ip->SrcAddr;
@@ -742,7 +844,7 @@ private:
             key.localPort = ntohs(isTcp ? tcp->SrcPort : udp->SrcPort);
             key.remotePort = ntohs(isTcp ? tcp->DstPort : udp->DstPort);
         }
-        else { // inbound
+        else {
             key.localAddr = ip->DstAddr;
             key.remoteAddr = ip->SrcAddr;
             key.localPort = ntohs(isTcp ? tcp->DstPort : udp->DstPort);
@@ -752,7 +854,7 @@ private:
 
         auto it = connToPid_.find(key);
 
-        // Fallback für UDP ohne Remote-Felder: match nur über localAddr/Port
+        // Fallback: UDP ohne Remote
         if (it == connToPid_.end() && protocol == IPPROTO_UDP) {
             ConnKey udpLocalOnly = key;
             udpLocalOnly.remoteAddr = 0;
@@ -761,7 +863,6 @@ private:
         }
 
         if (it == connToPid_.end()) {
-            // keine Zuordnung -> nicht limitieren
             return true;
         }
 
@@ -769,26 +870,25 @@ private:
 
         PriorityLevel level = GetPriorityForPid(pid);
 
-        // Statistiken (wie bisher)
         if (addr.Outbound)
             traffic_[pid].upload += recvLen;
         else
             traffic_[pid].download += recvLen;
 
-        // Zuerst Prioritätskette: niedrigere Stufen dürfen nur senden, wenn alle höheren "voll" sind
+        // 1) Prioritätskette
         if (!AllowByPriority(level, recvLen)) {
             return false;
         }
 
-        // Optional: PID-spezifische Kappe (z.B. um Prozesse innerhalb einer Stufe zu begrenzen)
+        // 2) per-PID-Limit (Token-Bucket)
         auto limIt = limits_.find(pid);
         if (limIt == limits_.end()) {
-            return true; // kein per-PID-Limit gesetzt
+            return true; // kein Limit, nur über Prioritäts-Bucket begrenzt
         }
 
         RateLimit& rl = limIt->second;
         if (rl.maxKBps <= 0.0) {
-            return false; // explizit blockiert
+            return false;
         }
 
         auto now = std::chrono::steady_clock::now();
@@ -813,70 +913,119 @@ private:
     void PrintStatsIfIntervalElapsed() {
         auto now = std::chrono::steady_clock::now();
         std::chrono::duration<double> diff = now - lastPrint_;
-        if (diff.count() < 1.0)
+        if (diff.count() < 1.0) // hier kannst du auf 0.5 runtergehen, wenn du willst
             return;
 
-        std::cout << "\nTraffic in den letzten "
-            << diff.count() << "s:\n";
+        double seconds = diff.count();
+
+        // JSON-Objekt mit STATS
+        json j;
+        j["type"] = "STATS";
+        j["interval_ms"] = (int)(seconds * 1000);
+        j["processes"] = json::array();
 
         for (const auto& [pid, stats] : traffic_) {
-            double upKB = stats.upload / 1024.0;
-            double downKB = stats.download / 1024.0;
+            double downKBs = (stats.download / 1024.0) / seconds;
+            double upKBs = (stats.upload / 1024.0) / seconds;
 
             std::string name = "<unknown>";
             auto itName = pidToName_.find(pid);
             if (itName != pidToName_.end()) {
                 const std::wstring& w = itName->second;
-                name.assign(w.begin(), w.end()); // einfache Konvertierung
+                name.assign(w.begin(), w.end());
             }
 
             PriorityLevel level = GetPriorityForPid(pid);
-            std::string prioString = (level == PriorityLevel::Unspecified)
-                ? "-"
-                : "P" + std::to_string(static_cast<int>(level));
 
-            std::cout << "PID " << pid
-                << " (" << name << ") "
-                << "[" << prioString << "] "
-                << "| Download: " << downKB << " KB/s"
-                << " | Upload: " << upKB << " KB/s"
-                << std::endl;
+            j["processes"].push_back({
+                {"pid",        pid},
+                {"name",       name},
+                {"prio",       (int)level},
+                {"down_kbps",  downKBs},
+                {"up_kbps",    upKBs}
+                });
         }
+
+        // an GUI schicken
+        SendJsonLine(j.dump());
 
         traffic_.clear();
         lastPrint_ = now;
 
-        // Map gelegentlich aktualisieren (für neue Verbindungen / Prozesse)
+        // aktuelle Maps neu aufbauen
         BuildConnectionPidMap(connToPid_);
         pidToName_ = BuildPidNameMap();
     }
 };
 
 // ------------------------------------------------------------
+// JSON-Kommandos aus Python verarbeiten
+// ------------------------------------------------------------
+
+void HandleJsonCommand(const std::string& line) {
+    if (!g_monitor) return;
+
+    json j = json::parse(line, nullptr, false);
+    if (j.is_discarded()) {
+        std::cerr << "JSON parse error\n";
+        return;
+    }
+
+    std::string type = j.value("type", "");
+    if (type == "SET_PROFILES") {
+        auto profs = j["profiles"];
+        double highMax = profs["high"].value("max_kbps", 60000.0);
+        double medMax = profs["medium"].value("max_kbps", 30000.0);
+        double lowMax = profs["low"].value("max_kbps", 10000.0);
+
+        g_monitor->SetPriorityProfile(PriorityLevel::High, 0.0, highMax);
+        g_monitor->SetPriorityProfile(PriorityLevel::Medium, 0.0, medMax);
+        g_monitor->SetPriorityProfile(PriorityLevel::Low, 0.0, lowMax);
+
+        std::cout << "SET_PROFILES empfangen\n";
+    }
+    else if (type == "SET_PRIORITIES") {
+        for (auto& item : j["priorities"]) {
+            DWORD pid = item.value("pid", 0u);
+            int   lvlInt = item.value("level", 99);
+            PriorityLevel lvl = (PriorityLevel)lvlInt;
+            g_monitor->SetPriority(pid, lvl);
+        }
+        std::cout << "SET_PRIORITIES empfangen\n";
+    }
+}
+
+// ------------------------------------------------------------
 // main
 // ------------------------------------------------------------
 
 int main() {
-    // Optional: einmalige CPU/Netzwerk-Übersicht
-    // calculateTaskManagerState();
+    // optional: calculateTaskManagerState();
+
+    // Server-Thread starten (für GUI)
+    std::thread serverThread(ServerThreadFunc);
 
     TrafficMonitor monitor;
+    g_monitor = &monitor;
+
     if (!monitor.Init()) {
+        g_running = false;
+        if (serverThread.joinable())
+            serverThread.join();
         return 1;
     }
 
-    // Beispielkonfiguration: Prioritäten und Limits
-    // Stufen nach Wunsch anpassen (KB/s). Niedrigere Stufen werden nur bedient,
-    // wenn alle höheren Token-Buckets voll sind (Top-Down-Hierarchie).
+    // Default-Profile (werden später von der GUI überschrieben)
     monitor.SetPriorityProfile(PriorityLevel::High, 0.0, 60000.0);
     monitor.SetPriorityProfile(PriorityLevel::Medium, 0.0, 30000.0);
     monitor.SetPriorityProfile(PriorityLevel::Low, 0.0, 10000.0);
 
-    // Konkrete PIDs zuweisen (hier Platzhalter-IDs ersetzen)
-    monitor.SetPriority(12564, PriorityLevel::High);   // z.B. Spiel
-    monitor.SetPriority(13100, PriorityLevel::Medium); // z.B. Browser
-    // monitor.SetPriority(9012, PriorityLevel::Low);    // Hintergrund
-
+    // Monitor läuft (blockiert)
     monitor.Run();
+
+    g_running = false;
+    if (serverThread.joinable())
+        serverThread.join();
+
     return 0;
 }
