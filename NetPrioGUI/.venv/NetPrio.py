@@ -5,58 +5,35 @@ from enum import Enum
 # ----------------------------------------------------------------------
 # Flexibler Import: zuerst PySide6 versuchen, dann PySide2
 # ----------------------------------------------------------------------
-try:
-    from PySide6.QtCore import (
-        Qt,
-        QAbstractTableModel,
-        QModelIndex,
-        Signal,
-        QObject,
-    )
-    from PySide6.QtWidgets import (
-        QApplication,
-        QMainWindow,
-        QWidget,
-        QVBoxLayout,
-        QHBoxLayout,
-        QTableView,
-        QPushButton,
-        QLabel,
-        QFormLayout,
-        QDoubleSpinBox,
-        QStyledItemDelegate,
-        QComboBox,
-        QLineEdit,
-        QGroupBox,
-    )
-    from PySide6.QtNetwork import QTcpSocket
-    PYSIDE_VERSION = "PySide6"
-except ImportError:
-    from PySide2.QtCore import (
-        Qt,
-        QAbstractTableModel,
-        QModelIndex,
-        Signal,
-        QObject,
-    )
-    from PySide2.QtWidgets import (
-        QApplication,
-        QMainWindow,
-        QWidget,
-        QVBoxLayout,
-        QHBoxLayout,
-        QTableView,
-        QPushButton,
-        QLabel,
-        QFormLayout,
-        QDoubleSpinBox,
-        QStyledItemDelegate,
-        QComboBox,
-        QLineEdit,
-        QGroupBox,
-    )
-    from PySide2.QtNetwork import QTcpSocket
-    PYSIDE_VERSION = "PySide2"
+from PySide6.QtCore import (
+    Qt,
+    QAbstractTableModel,
+    QModelIndex,
+    Signal,
+    QObject,
+)
+
+from PySide6.QtWidgets import (
+    QApplication,
+    QMainWindow,
+    QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QTableView,
+    QPushButton,
+    QLabel,
+    QFormLayout,
+    QDoubleSpinBox,
+    QStyledItemDelegate,
+    QComboBox,
+    QLineEdit,
+    QGroupBox,
+)
+
+from PySide6.QtNetwork import QTcpSocket
+
+PYSIDE_VERSION = "PySide6"
+
 
 
 # ----------------------------------------------------------------------
