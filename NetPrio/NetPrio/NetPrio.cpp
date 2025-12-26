@@ -16,18 +16,184 @@
 #include <iostream>
 #include <string>
 #include <thread>
-#include <mutex>
 #include <atomic>
 #include <unordered_map>
 #include <vector>
 #include <chrono>
-#include <cmath>
 #include <array>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <exception>
+
+#include <eh.h>   // _set_se_translator
 
 #include "windivert.h"
 #include "json.hpp" // nlohmann::json single header
 using json = nlohmann::json;
+
+// ============================================================
+// WinAPI lock wrappers (NO std::mutex anywhere)
+// ============================================================
+struct SrwExclusiveGuard
+{
+    SRWLOCK* lock = nullptr;
+    explicit SrwExclusiveGuard(SRWLOCK& l) : lock(&l) { AcquireSRWLockExclusive(lock); }
+    ~SrwExclusiveGuard() { ReleaseSRWLockExclusive(lock); }
+    SrwExclusiveGuard(const SrwExclusiveGuard&) = delete;
+    SrwExclusiveGuard& operator=(const SrwExclusiveGuard&) = delete;
+};
+
+// ============================================================
+// Logging helpers (console + file + OutputDebugString)
+// ============================================================
+
+static INIT_ONCE g_logInitOnce = INIT_ONCE_STATIC_INIT;
+static CRITICAL_SECTION g_logCs;
+
+static BOOL CALLBACK InitLogCsFn(PINIT_ONCE, PVOID, PVOID*)
+{
+    InitializeCriticalSection(&g_logCs);
+    return TRUE;
+}
+
+static void LogLock()
+{
+    InitOnceExecuteOnce(&g_logInitOnce, InitLogCsFn, nullptr, nullptr);
+    EnterCriticalSection(&g_logCs);
+}
+
+static void LogUnlock()
+{
+    LeaveCriticalSection(&g_logCs);
+}
+
+struct LogGuard
+{
+    LogGuard() { LogLock(); }
+    ~LogGuard() { LogUnlock(); }
+};
+
+static std::ofstream g_logFile;
+
+static std::string NowTimestamp()
+{
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
+        (int)st.wYear, (int)st.wMonth, (int)st.wDay,
+        (int)st.wHour, (int)st.wMinute, (int)st.wSecond, (int)st.wMilliseconds);
+    return buf;
+}
+
+static DWORD ThreadId()
+{
+    return GetCurrentThreadId();
+}
+
+static std::string Win32ErrorToString(DWORD err)
+{
+    if (err == 0) return "OK";
+    LPSTR msgBuf = nullptr;
+    DWORD size = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        err,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        (LPSTR)&msgBuf,
+        0,
+        nullptr
+    );
+    std::string msg = (size && msgBuf) ? std::string(msgBuf, size) : std::string("Unknown error");
+    if (msgBuf) LocalFree(msgBuf);
+    while (!msg.empty() && (msg.back() == '\r' || msg.back() == '\n')) msg.pop_back();
+    return msg;
+}
+
+static void LogLine(const char* level, const std::string& s)
+{
+    LogGuard g;
+    std::ostringstream oss;
+    oss << "[" << NowTimestamp() << "]"
+        << "[T" << ThreadId() << "]"
+        << "[" << level << "] "
+        << s;
+
+    const std::string line = oss.str();
+    std::cout << line << std::endl;
+    OutputDebugStringA((line + "\n").c_str());
+
+    if (g_logFile.is_open())
+    {
+        g_logFile << line << "\n";
+        g_logFile.flush();
+    }
+}
+
+static void LOGI(const std::string& s) { LogLine("INFO", s); }
+static void LOGW(const std::string& s) { LogLine("WARN", s); }
+static void LOGE(const std::string& s) { LogLine("ERR ", s); }
+
+static bool HasConsole()
+{
+    return GetConsoleWindow() != nullptr;
+}
+
+static void PauseAlways()
+{
+    if (HasConsole())
+        system("pause");
+}
+
+static int PauseAndReturn(int code)
+{
+    std::ostringstream oss;
+    oss << "Exiting with code " << code;
+    LOGW(oss.str());
+    PauseAlways();
+    return code;
+}
+
+// ============================================================
+// Crash / unhandled exception handler
+// ============================================================
+static LONG WINAPI UnhandledExceptionFilterFunc(EXCEPTION_POINTERS* ep)
+{
+    DWORD code = ep ? ep->ExceptionRecord->ExceptionCode : 0;
+    std::ostringstream oss;
+    oss << "UNHANDLED EXCEPTION! Code=0x" << std::hex << code;
+
+    if (ep && ep->ExceptionRecord)
+        oss << " Address=" << ep->ExceptionRecord->ExceptionAddress;
+
+    LOGE(oss.str());
+
+    DWORD gle = GetLastError();
+    std::ostringstream oss2;
+    oss2 << "GetLastError=" << std::dec << gle << " (" << Win32ErrorToString(gle) << ")";
+    LOGE(oss2.str());
+
+    PauseAlways();
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+// ============================================================
+// SEH -> C++ Exception translator (needs /EHa to be catchable)
+// ============================================================
+struct SehException : public std::exception
+{
+    unsigned int code;
+    void* address;
+    SehException(unsigned int c, void* a) : code(c), address(a) {}
+    const char* what() const noexcept override { return "SEH exception (translated)"; }
+};
+
+static void SehTranslator(unsigned int code, EXCEPTION_POINTERS* ep)
+{
+    void* addr = ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : nullptr;
+    throw SehException(code, addr);
+}
 
 // ------------------------------------------------------------
 // Helpers
@@ -36,22 +202,77 @@ static std::string WideToUtf8(const std::wstring& w)
 {
     if (w.empty()) return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
-    if (len <= 0) return {};
+    if (len <= 0)
+    {
+        DWORD gle = GetLastError();
+        std::ostringstream oss;
+        oss << "WideCharToMultiByte size failed. GLE=" << gle << " (" << Win32ErrorToString(gle) << ")";
+        LOGW(oss.str());
+        return {};
+    }
     std::string out;
     out.resize((size_t)len);
-    WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), len, nullptr, nullptr);
+    int ok = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), out.data(), len, nullptr, nullptr);
+    if (ok <= 0)
+    {
+        DWORD gle = GetLastError();
+        std::ostringstream oss;
+        oss << "WideCharToMultiByte convert failed. GLE=" << gle << " (" << Win32ErrorToString(gle) << ")";
+        LOGW(oss.str());
+        return {};
+    }
     return out;
 }
 
 static inline void SetAddrV4(std::array<uint8_t, 16>& dst, UINT32 v4)
 {
     dst.fill(0);
-    std::memcpy(dst.data(), &v4, sizeof(v4)); // keep as network-order value coming from headers/tables
+    std::memcpy(dst.data(), &v4, sizeof(v4));
 }
 
 static inline void SetAddrV6(std::array<uint8_t, 16>& dst, const void* v6_16bytes)
 {
     std::memcpy(dst.data(), v6_16bytes, 16);
+}
+
+// ------------------------------------------------------------
+// TeamViewer helpers
+// ------------------------------------------------------------
+static bool IsTeamViewerProcessName(const std::wstring& exe)
+{
+    if (_wcsicmp(exe.c_str(), L"TeamViewer.exe") == 0) return true;
+    if (_wcsicmp(exe.c_str(), L"TeamViewer_Service.exe") == 0) return true;
+    if (_wcsicmp(exe.c_str(), L"tv_x64.exe") == 0) return true;
+    if (_wcsicmp(exe.c_str(), L"tv_w32.exe") == 0) return true;
+    if (exe.size() >= 9 && _wcsnicmp(exe.c_str(), L"TeamViewer", 9) == 0) return true;
+    return false;
+}
+
+static bool IsAnyTeamViewerRunning()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32 pe{};
+    pe.dwSize = sizeof(pe);
+    if (!Process32First(snap, &pe))
+    {
+        CloseHandle(snap);
+        return false;
+    }
+
+    bool found = false;
+    do
+    {
+        if (IsTeamViewerProcessName(pe.szExeFile))
+        {
+            found = true;
+            break;
+        }
+    } while (Process32Next(snap, &pe));
+
+    CloseHandle(snap);
+    return found;
 }
 
 // ------------------------------------------------------------
@@ -64,7 +285,7 @@ struct ConnKey
     std::array<uint8_t, 16> remoteAddr{};
     UINT16 localPort = 0;
     UINT16 remotePort = 0;
-    UINT8 protocol = 0; // IPPROTO_TCP / IPPROTO_UDP
+    UINT8 protocol = 0;
 
     bool operator==(const ConnKey& o) const noexcept
     {
@@ -81,7 +302,6 @@ struct ConnKeyHash
 {
     static inline std::size_t HashBytes16(const std::array<uint8_t, 16>& a) noexcept
     {
-        // hash 16 bytes as two uint64 chunks
         uint64_t x = 0, y = 0;
         std::memcpy(&x, a.data(), 8);
         std::memcpy(&y, a.data() + 8, 8);
@@ -125,14 +345,13 @@ enum class PriorityLevel : int
 
 struct PriorityProfile
 {
-    double minKBps = 0.0; // reserved not fully implemented (needs queueing)
-    double maxKBps = 0.0; // cap
+    double minKBps = 0.0;
+    double maxKBps = 0.0;
 };
 
-// Token bucket limiter (per PID)
 struct TokenBucket
 {
-    double maxKBps = 0.0; // rate (KB/s)
+    double maxKBps = 0.0;
     double tokensBytes = 0.0;
     std::chrono::steady_clock::time_point last;
     bool initialized = false;
@@ -162,7 +381,6 @@ struct TokenBucket
         double rateBytesPerSec = maxKBps * 1024.0;
         tokensBytes += rateBytesPerSec * dt;
 
-        // cap at 1 second burst (simple)
         double maxTokens = rateBytesPerSec;
         if (tokensBytes > maxTokens) tokensBytes = maxTokens;
 
@@ -176,18 +394,33 @@ struct TokenBucket
 };
 
 // ------------------------------------------------------------
-// Global socket server state
+// Global socket server state (NO std::mutex)
 // ------------------------------------------------------------
 static std::atomic_bool g_running(true);
 static SOCKET g_clientSocket = INVALID_SOCKET;
-static std::mutex g_clientMutex;
+static SRWLOCK g_clientLock = SRWLOCK_INIT;
+
+static std::atomic_bool g_teamViewerBypassLogged(false);
+
+// ✅ Limiter ON/OFF state:
+// OFF => sniff mode (no reinject -> full speed)
+// ON  => divert mode (reinject + rate-limit)
+static std::atomic_bool g_limiterEnabled(false);
 
 static void SendJsonLine(const std::string& line)
 {
-    std::lock_guard<std::mutex> lock(g_clientMutex);
+    SrwExclusiveGuard g(g_clientLock);
     if (g_clientSocket == INVALID_SOCKET) return;
+
     std::string msg = line + "\n";
-    send(g_clientSocket, msg.c_str(), (int)msg.size(), 0);
+    int r = send(g_clientSocket, msg.c_str(), (int)msg.size(), 0);
+    if (r == SOCKET_ERROR)
+    {
+        int wsa = WSAGetLastError();
+        std::ostringstream oss;
+        oss << "send() failed. WSA=" << wsa;
+        LOGW(oss.str());
+    }
 }
 
 // ------------------------------------------------------------
@@ -197,27 +430,31 @@ static std::unordered_map<DWORD, std::wstring> BuildPidNameMap()
 {
     std::unordered_map<DWORD, std::wstring> pidToName;
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (snap == INVALID_HANDLE_VALUE) return pidToName;
+    if (snap == INVALID_HANDLE_VALUE)
+    {
+        DWORD gle = GetLastError();
+        LOGW("CreateToolhelp32Snapshot failed. GLE=" + std::to_string(gle) + " (" + Win32ErrorToString(gle) + ")");
+        return pidToName;
+    }
 
     PROCESSENTRY32 pe{};
     pe.dwSize = sizeof(pe);
     if (!Process32First(snap, &pe))
     {
+        DWORD gle = GetLastError();
+        LOGW("Process32First failed. GLE=" + std::to_string(gle) + " (" + Win32ErrorToString(gle) + ")");
         CloseHandle(snap);
         return pidToName;
     }
 
-    do
-    {
-        pidToName[pe.th32ProcessID] = pe.szExeFile;
-    } while (Process32Next(snap, &pe));
+    do { pidToName[pe.th32ProcessID] = pe.szExeFile; } while (Process32Next(snap, &pe));
 
     CloseHandle(snap);
     return pidToName;
 }
 
 // ------------------------------------------------------------
-// Connection -> PID map (TCP + UDP) (IPv4 + IPv6)
+// Connection -> PID map
 // ------------------------------------------------------------
 static bool BuildConnectionPidMap(std::unordered_map<ConnKey, DWORD, ConnKeyHash>& connToPid)
 {
@@ -247,7 +484,7 @@ static bool BuildConnectionPidMap(std::unordered_map<ConnKey, DWORD, ConnKeyHash
                 ConnKey k{};
                 k.isV6 = false;
                 SetAddrV4(k.localAddr, row.dwLocalAddr);
-                k.remoteAddr.fill(0); // wildcard
+                k.remoteAddr.fill(0);
                 k.localPort = ntohs((u_short)row.dwLocalPort);
                 k.remotePort = 0;
                 k.protocol = IPPROTO_UDP;
@@ -262,7 +499,6 @@ static bool BuildConnectionPidMap(std::unordered_map<ConnKey, DWORD, ConnKeyHash
                 const auto& row = pTable6->table[i];
                 ConnKey k{};
                 k.isV6 = true;
-                // row.ucLocalAddr / row.ucRemoteAddr are 16 bytes
                 SetAddrV6(k.localAddr, row.ucLocalAddr);
                 SetAddrV6(k.remoteAddr, row.ucRemoteAddr);
                 k.localPort = ntohs((u_short)row.dwLocalPort);
@@ -280,7 +516,7 @@ static bool BuildConnectionPidMap(std::unordered_map<ConnKey, DWORD, ConnKeyHash
                 ConnKey k{};
                 k.isV6 = true;
                 SetAddrV6(k.localAddr, row.ucLocalAddr);
-                k.remoteAddr.fill(0); // wildcard
+                k.remoteAddr.fill(0);
                 k.localPort = ntohs((u_short)row.dwLocalPort);
                 k.remotePort = 0;
                 k.protocol = IPPROTO_UDP;
@@ -294,21 +530,19 @@ static bool BuildConnectionPidMap(std::unordered_map<ConnKey, DWORD, ConnKeyHash
         DWORD r = GetExtendedTcpTable(nullptr, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
         if (r != ERROR_INSUFFICIENT_BUFFER)
         {
-            std::cerr << "GetExtendedTcpTable(AF_INET,size) failed: " << r << "\n";
+            LOGE("GetExtendedTcpTable(AF_INET,size) unexpected: " + std::to_string(r));
             return false;
         }
-
         auto* pTable = (PMIB_TCPTABLE_OWNER_PID)malloc(size);
-        if (!pTable) return false;
+        if (!pTable) { LOGE("malloc TCP table failed"); return false; }
 
         r = GetExtendedTcpTable(pTable, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0);
         if (r != NO_ERROR)
         {
-            std::cerr << "GetExtendedTcpTable(AF_INET) failed: " << r << "\n";
+            LOGE("GetExtendedTcpTable(AF_INET) failed: " + std::to_string(r));
             free(pTable);
             return false;
         }
-
         addTcp4(pTable);
         free(pTable);
     }
@@ -319,21 +553,19 @@ static bool BuildConnectionPidMap(std::unordered_map<ConnKey, DWORD, ConnKeyHash
         DWORD r = GetExtendedUdpTable(nullptr, &size, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0);
         if (r != ERROR_INSUFFICIENT_BUFFER)
         {
-            std::cerr << "GetExtendedUdpTable(AF_INET,size) failed: " << r << "\n";
+            LOGE("GetExtendedUdpTable(AF_INET,size) unexpected: " + std::to_string(r));
             return false;
         }
-
         auto* pTable = (PMIB_UDPTABLE_OWNER_PID)malloc(size);
-        if (!pTable) return false;
+        if (!pTable) { LOGE("malloc UDP table failed"); return false; }
 
         r = GetExtendedUdpTable(pTable, &size, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0);
         if (r != NO_ERROR)
         {
-            std::cerr << "GetExtendedUdpTable(AF_INET) failed: " << r << "\n";
+            LOGE("GetExtendedUdpTable(AF_INET) failed: " + std::to_string(r));
             free(pTable);
             return false;
         }
-
         addUdp4(pTable);
         free(pTable);
     }
@@ -345,22 +577,21 @@ static bool BuildConnectionPidMap(std::unordered_map<ConnKey, DWORD, ConnKeyHash
         if (r == ERROR_INSUFFICIENT_BUFFER)
         {
             auto* pTable6 = (PMIB_TCP6TABLE_OWNER_PID)malloc(size);
-            if (!pTable6) return false;
+            if (!pTable6) { LOGE("malloc TCP6 table failed"); return false; }
 
             r = GetExtendedTcpTable(pTable6, &size, TRUE, AF_INET6, TCP_TABLE_OWNER_PID_ALL, 0);
             if (r != NO_ERROR)
             {
-                std::cerr << "GetExtendedTcpTable(AF_INET6) failed: " << r << "\n";
+                LOGE("GetExtendedTcpTable(AF_INET6) failed: " + std::to_string(r));
                 free(pTable6);
                 return false;
             }
-
             addTcp6(pTable6);
             free(pTable6);
         }
         else if (r != NO_ERROR)
         {
-            // some systems may return NO_ERROR with size=0; ignore quietly
+            LOGW("GetExtendedTcpTable(AF_INET6) returned: " + std::to_string(r) + " (ignored on some systems)");
         }
     }
 
@@ -371,22 +602,21 @@ static bool BuildConnectionPidMap(std::unordered_map<ConnKey, DWORD, ConnKeyHash
         if (r == ERROR_INSUFFICIENT_BUFFER)
         {
             auto* pTable6 = (PMIB_UDP6TABLE_OWNER_PID)malloc(size);
-            if (!pTable6) return false;
+            if (!pTable6) { LOGE("malloc UDP6 table failed"); return false; }
 
             r = GetExtendedUdpTable(pTable6, &size, TRUE, AF_INET6, UDP_TABLE_OWNER_PID, 0);
             if (r != NO_ERROR)
             {
-                std::cerr << "GetExtendedUdpTable(AF_INET6) failed: " << r << "\n";
+                LOGE("GetExtendedUdpTable(AF_INET6) failed: " + std::to_string(r));
                 free(pTable6);
                 return false;
             }
-
             addUdp6(pTable6);
             free(pTable6);
         }
         else if (r != NO_ERROR)
         {
-            // ignore quietly if unsupported
+            LOGW("GetExtendedUdpTable(AF_INET6) returned: " + std::to_string(r) + " (ignored on some systems)");
         }
     }
 
@@ -399,79 +629,137 @@ static bool BuildConnectionPidMap(std::unordered_map<ConnKey, DWORD, ConnKeyHash
 class TrafficMonitor
 {
 public:
+    TrafficMonitor() {}
+    ~TrafficMonitor() = default;
+
     bool Init()
     {
-        pidToName_ = BuildPidNameMap();
-        if (!BuildConnectionPidMap(connToPid_))
+        LOGI("TrafficMonitor::Init() start");
+
         {
-            std::cerr << "BuildConnectionPidMap failed\n";
-            return false;
+            SrwExclusiveGuard lock(mtx_);
+            pidToName_ = BuildPidNameMap();
+            if (!BuildConnectionPidMap(connToPid_))
+            {
+                LOGE("BuildConnectionPidMap failed");
+                return false;
+            }
+
+            // default profiles (can be overwritten by GUI)
+            profiles_[PriorityLevel::High] = { 0.0, 10000.0 };
+            profiles_[PriorityLevel::Medium] = { 0.0, 5000.0 };
+            profiles_[PriorityLevel::Low] = { 0.0, 1000.0 };
+            profiles_[PriorityLevel::Unspecified] = { 0.0, 1000000.0 };
         }
 
-        // capture+inject (no SNIFF) - IPv4 + IPv6
-        handle_ = WinDivertOpen("((ip or ipv6) and (tcp or udp))", WINDIVERT_LAYER_NETWORK, 0, 0);
-        if (handle_ == INVALID_HANDLE_VALUE)
+        if (IsAnyTeamViewerRunning())
         {
-            std::cerr << "WinDivertOpen failed: " << GetLastError() << "\n";
-            return false;
+            bool expected = false;
+            if (g_teamViewerBypassLogged.compare_exchange_strong(expected, true))
+            {
+                LOGW("TeamViewer erkannt: Pakete werden NICHT gefiltert/limitiert, "
+                    "weil Remote-Verbindung sonst abbrechen kann (gleiche Netzwerkschnittstelle).");
+            }
         }
 
-        // default profiles (GUI can overwrite)
-        profiles_[PriorityLevel::High] = { 0.0, 10000.0 };
-        profiles_[PriorityLevel::Medium] = { 0.0, 5000.0 };
-        profiles_[PriorityLevel::Low] = { 0.0, 1000.0 };
-        profiles_[PriorityLevel::Unspecified] = { 0.0, 1000000.0 };
+        // Default: SNIFF mode (no reinject -> no throughput cap)
+        requestedMode_.store((int)CaptureMode::Sniff);
+        currentMode_.store((int)CaptureMode::None);
 
-        std::cout << "WinDivert ready. conn map size=" << connToPid_.size() << "\n";
+        if (!ReopenHandleIfNeeded(/*force*/true))
+            return false;
+
+        LOGI("TrafficMonitor::Init() OK");
         return true;
     }
 
     void Shutdown()
     {
-        if (handle_ != INVALID_HANDLE_VALUE)
-        {
-            WinDivertClose(handle_);
-            handle_ = INVALID_HANDLE_VALUE;
-        }
+        LOGI("TrafficMonitor::Shutdown()");
+        CloseHandle();
     }
 
     void RunCaptureLoop()
     {
+        LOGI("TrafficMonitor::RunCaptureLoop() start");
+
         const UINT MAX_PACKET = 0xFFFF;
         std::vector<char> packet(MAX_PACKET);
         WINDIVERT_ADDRESS addr{};
+
         while (g_running)
         {
+            // Switch mode if GUI changed limiter state
+            if (!ReopenHandleIfNeeded(/*force*/false))
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+
             UINT recvLen = 0;
             if (!WinDivertRecv(handle_, packet.data(), (UINT)packet.size(), &recvLen, &addr))
             {
                 DWORD err = GetLastError();
                 if (!g_running) break;
-                std::cerr << "WinDivertRecv failed: " << err << "\n";
+
+                LOGE("WinDivertRecv failed. GLE=" + std::to_string(err) + " (" + Win32ErrorToString(err) + ")");
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
 
-            bool allow = ProcessPacket(packet.data(), recvLen, addr);
-            if (allow)
+            bool allow = true;
+            try
             {
-                if (!WinDivertSend(handle_, packet.data(), recvLen, nullptr, &addr))
-                {
-                    std::cerr << "WinDivertSend failed: " << GetLastError() << "\n";
-                }
+                allow = ProcessPacket(packet.data(), recvLen, addr);
             }
-            // else drop
+            catch (const SehException& se)
+            {
+                std::ostringstream oss;
+                oss << "SEH exception in ProcessPacket: code=0x" << std::hex << se.code
+                    << " addr=" << se.address;
+                LOGE(oss.str());
+                allow = true; // fail-open
+            }
+            catch (const std::exception& e)
+            {
+                LOGE(std::string("std::exception in ProcessPacket: ") + e.what());
+                allow = true;
+            }
+            catch (...)
+            {
+                LOGE("Unknown exception in ProcessPacket");
+                allow = true;
+            }
+
+            // ✅ IMPORTANT:
+            // - In SNIFF mode we DO NOT reinject (WinDivert already lets packet pass).
+            // - In DIVERT mode we MUST reinject allowed packets.
+            CaptureMode mode = (CaptureMode)currentMode_.load();
+            if (mode == CaptureMode::Divert)
+            {
+                if (allow)
+                {
+                    if (!WinDivertSend(handle_, packet.data(), recvLen, nullptr, &addr))
+                    {
+                        DWORD err = GetLastError();
+                        LOGW("WinDivertSend failed. GLE=" + std::to_string(err) + " (" + Win32ErrorToString(err) + ")");
+                    }
+                }
+                // else: drop by not re-injecting
+            }
         }
+
+        LOGW("TrafficMonitor::RunCaptureLoop() ended");
     }
 
-    // called by stats thread every interval
     void PublishStats(int intervalMs)
     {
-        // snapshot traffic map (and clear) under lock
         std::unordered_map<DWORD, TrafficCounters> snapshot;
         std::unordered_map<DWORD, PriorityLevel> prioSnapshot;
         std::unordered_map<DWORD, std::wstring> nameSnapshot;
+
         {
-            std::lock_guard<std::mutex> lock(mtx_);
+            SrwExclusiveGuard lock(mtx_);
             snapshot.swap(traffic_);
             prioSnapshot = pidPriority_;
             nameSnapshot = pidToName_;
@@ -480,91 +768,133 @@ public:
         double seconds = intervalMs / 1000.0;
         if (seconds <= 0.0) seconds = 1.0;
 
-        // Build JSON
-        json j;
-        j["type"] = "STATS";
-        j["interval_ms"] = intervalMs;
-        j["processes"] = json::array();
-
-        // union: all pids with traffic + all pids that have priority set
-        std::unordered_map<DWORD, bool> include;
-        include.reserve(snapshot.size() + prioSnapshot.size());
-        for (auto& kv : snapshot) include[kv.first] = true;
-        for (auto& kv : prioSnapshot) include[kv.first] = true;
-
-        for (auto& kv : include)
+        try
         {
-            DWORD pid = kv.first;
-            TrafficCounters tc{};
-            auto itT = snapshot.find(pid);
-            if (itT != snapshot.end()) tc = itT->second;
+            json j;
+            j["type"] = "STATS";
+            j["interval_ms"] = intervalMs;
+            j["processes"] = json::array();
 
-            PriorityLevel lvl = PriorityLevel::Unspecified;
-            auto itP = prioSnapshot.find(pid);
-            if (itP != prioSnapshot.end()) lvl = itP->second;
+            std::unordered_map<DWORD, bool> include;
+            include.reserve(snapshot.size() + prioSnapshot.size());
+            for (auto& kv : snapshot) include[kv.first] = true;
+            for (auto& kv : prioSnapshot) include[kv.first] = true;
 
-            std::string name = "<unknown>";
-            auto itN = nameSnapshot.find(pid);
-            if (itN != nameSnapshot.end())
+            for (auto& kv : include)
             {
-                name = WideToUtf8(itN->second);
-                if (name.empty()) name = "<unknown>";
+                DWORD pid = kv.first;
+
+                TrafficCounters tc{};
+                auto itT = snapshot.find(pid);
+                if (itT != snapshot.end()) tc = itT->second;
+
+                PriorityLevel lvl = PriorityLevel::Unspecified;
+                auto itP = prioSnapshot.find(pid);
+                if (itP != prioSnapshot.end()) lvl = itP->second;
+
+                std::string name = "<unknown>";
+                auto itN = nameSnapshot.find(pid);
+                if (itN != nameSnapshot.end())
+                {
+                    name = WideToUtf8(itN->second);
+                    if (name.empty()) name = "<unknown>";
+                }
+
+                double downKBs = (tc.downloadBytes / 1024.0) / seconds;
+                double upKBs = (tc.uploadBytes / 1024.0) / seconds;
+
+                j["processes"].push_back({
+                    {"pid", pid},
+                    {"name", name},
+                    {"prio", (int)lvl},
+                    {"down_kbps", downKBs},
+                    {"up_kbps", upKBs}
+                    });
             }
 
-            double downKBs = (tc.downloadBytes / 1024.0) / seconds;
-            double upKBs = (tc.uploadBytes / 1024.0) / seconds;
-
-            j["processes"].push_back({
-                {"pid", pid},
-                {"name", name},
-                {"prio", (int)lvl},
-                {"down_kbps", downKBs},
-                {"up_kbps", upKBs}
-                });
+            SendJsonLine(j.dump());
+        }
+        catch (...)
+        {
+            LOGE("PublishStats unknown exception");
         }
 
-        SendJsonLine(j.dump());
-
-        // refresh name/conn map occasionally
         static int tick = 0;
         tick++;
-        if (tick % 2 == 0) // every ~2 seconds
+        if (tick % 2 == 0)
         {
-            std::lock_guard<std::mutex> lock(mtx_);
+            SrwExclusiveGuard lock(mtx_);
             pidToName_ = BuildPidNameMap();
-            BuildConnectionPidMap(connToPid_);
+            if (!BuildConnectionPidMap(connToPid_))
+                LOGW("BuildConnectionPidMap failed in refresh (keeping old map)");
         }
     }
 
-    // GUI commands
     void SetPriorityProfile(PriorityLevel level, double minKBps, double maxKBps)
     {
-        std::lock_guard<std::mutex> lock(mtx_);
+        SrwExclusiveGuard lock(mtx_);
         profiles_[level] = { minKBps, maxKBps };
 
-        // Update per PID buckets of this level
-        for (const auto& [pid, lvl] : pidPriority_)
+        // Update existing buckets (only matters in limiter mode)
+        for (auto& kv : pidBuckets_)
         {
-            if (lvl == level)
-            {
-                pidBuckets_[pid].Reset(maxKBps);
-            }
+            DWORD pid = kv.first;
+            PriorityLevel lvl = PriorityLevel::Low;
+            auto itP = pidPriority_.find(pid);
+            if (itP != pidPriority_.end()) lvl = itP->second;
+            if (lvl == PriorityLevel::Unspecified) lvl = PriorityLevel::Low;
+
+            double cap = GetProfileMaxKBps_NoLock(lvl);
+            kv.second.Reset(cap);
         }
+
+        LOGI("SetPriorityProfile level=" + std::to_string((int)level) + " maxKBps=" + std::to_string(maxKBps));
+    }
+
+    void ClearAllPriorities_DisableLimiter()
+    {
+        SrwExclusiveGuard lock(mtx_);
+        pidPriority_.clear();
+        pidBuckets_.clear();
+
+        g_limiterEnabled.store(false);
+        requestedMode_.store((int)CaptureMode::Sniff);
+
+        LOGW("Limiter deaktiviert: SNIFF Mode (ungefiltert, kein Reinjection-Overhead).");
     }
 
     void SetPriority(DWORD pid, PriorityLevel level)
     {
-        std::lock_guard<std::mutex> lock(mtx_);
+        SrwExclusiveGuard lock(mtx_);
         pidPriority_[pid] = level;
 
-        // apply cap via per-pid bucket
-        double cap = GetProfileMaxKBps_NoLock(level);
+        // Enable limiter only if real priority
+        if (level == PriorityLevel::High || level == PriorityLevel::Medium || level == PriorityLevel::Low)
+        {
+            g_limiterEnabled.store(true);
+            requestedMode_.store((int)CaptureMode::Divert);
+        }
+
+        PriorityLevel eff = level;
+        if (eff == PriorityLevel::Unspecified) eff = PriorityLevel::Low;
+
+        double cap = GetProfileMaxKBps_NoLock(eff);
         pidBuckets_[pid].Reset(cap);
+
+        LOGI("SetPriority pid=" + std::to_string(pid) +
+            " level=" + std::to_string((int)level) +
+            " capKBps=" + std::to_string(cap));
     }
 
 private:
+    enum class CaptureMode : int { None = 0, Sniff = 1, Divert = 2 };
+
     HANDLE handle_ = INVALID_HANDLE_VALUE;
-    std::mutex mtx_;
+    SRWLOCK mtx_ = SRWLOCK_INIT;
+
+    std::atomic_int requestedMode_{ (int)CaptureMode::Sniff };
+    std::atomic_int currentMode_{ (int)CaptureMode::None };
+
     std::unordered_map<ConnKey, DWORD, ConnKeyHash> connToPid_;
     std::unordered_map<DWORD, std::wstring> pidToName_;
     std::unordered_map<DWORD, TrafficCounters> traffic_;
@@ -573,6 +903,61 @@ private:
     std::unordered_map<DWORD, TokenBucket> pidBuckets_;
 
 private:
+    void CloseHandle()
+    {
+        if (handle_ != INVALID_HANDLE_VALUE)
+        {
+            WinDivertClose(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
+        currentMode_.store((int)CaptureMode::None);
+    }
+
+    bool OpenHandle(CaptureMode mode)
+    {
+        CloseHandle();
+
+        const char* filter = "((ip or ipv6) and (tcp or udp))";
+        UINT64 flags = 0;
+
+        if (mode == CaptureMode::Sniff)
+            flags = WINDIVERT_FLAG_SNIFF; // capture copy, do NOT block, no reinject needed
+        else
+            flags = 0; // divert (block + reinject)
+
+        LOGI(std::string("WinDivertOpen mode=") + (mode == CaptureMode::Sniff ? "SNIFF" : "DIVERT") + "...");
+
+        handle_ = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 0, flags);
+        if (handle_ == INVALID_HANDLE_VALUE)
+        {
+            DWORD gle = GetLastError();
+            std::ostringstream oss;
+            oss << "WinDivertOpen failed. Mode=" << (mode == CaptureMode::Sniff ? "SNIFF" : "DIVERT")
+                << " GLE=" << gle << " (" << Win32ErrorToString(gle) << ").";
+            LOGE(oss.str());
+            return false;
+        }
+
+        currentMode_.store((int)mode);
+        LOGI("WinDivertOpen OK.");
+        return true;
+    }
+
+    bool ReopenHandleIfNeeded(bool force)
+    {
+        CaptureMode want = (CaptureMode)requestedMode_.load();
+        CaptureMode cur = (CaptureMode)currentMode_.load();
+
+        if (!force && want == cur)
+            return true;
+
+        // reopen with requested mode
+        if (!OpenHandle(want))
+            return false;
+
+        return true;
+    }
+
     double GetProfileMaxKBps_NoLock(PriorityLevel lvl) const
     {
         auto it = profiles_.find(lvl);
@@ -580,13 +965,6 @@ private:
         auto itU = profiles_.find(PriorityLevel::Unspecified);
         if (itU != profiles_.end()) return itU->second.maxKBps;
         return 1000000.0;
-    }
-
-    PriorityLevel GetPriority_NoLock(DWORD pid) const
-    {
-        auto it = pidPriority_.find(pid);
-        if (it != pidPriority_.end()) return it->second;
-        return PriorityLevel::Unspecified;
     }
 
     bool ProcessPacket(char* packet, UINT recvLen, const WINDIVERT_ADDRESS& addr)
@@ -597,15 +975,8 @@ private:
         PWINDIVERT_TCPHDR tcp = nullptr;
         PWINDIVERT_UDPHDR udp = nullptr;
 
-        if (!WinDivertHelperParsePacket(
-            packet, recvLen,
-            &ip, &ipv6, &protocol,
-            nullptr, nullptr,
-            &tcp, &udp,
-            nullptr, nullptr, nullptr, nullptr))
-        {
+        if (!WinDivertHelperParsePacket(packet, recvLen, &ip, &ipv6, &protocol, nullptr, nullptr, &tcp, &udp, nullptr, nullptr, nullptr, nullptr))
             return true;
-        }
 
         const bool isTcp = (protocol == IPPROTO_TCP);
         const bool isUdp = (protocol == IPPROTO_UDP);
@@ -640,7 +1011,6 @@ private:
         }
         else
         {
-            // IPv6
             if (addr.Outbound)
             {
                 SetAddrV6(key.localAddr, ipv6->SrcAddr);
@@ -657,45 +1027,70 @@ private:
             }
         }
 
+        SrwExclusiveGuard lock(mtx_);
+
+        auto it = connToPid_.find(key);
+        if (it == connToPid_.end() && isUdp)
         {
-            std::lock_guard<std::mutex> lock(mtx_);
-
-            auto it = connToPid_.find(key);
-
-            // UDP fallback: match by local only (both v4 and v6)
-            if (it == connToPid_.end() && isUdp)
-            {
-                ConnKey localOnly = key;
-                localOnly.remoteAddr.fill(0);
-                localOnly.remotePort = 0;
-                it = connToPid_.find(localOnly);
-            }
-
-            if (it == connToPid_.end())
-            {
-                // unknown mapping: allow to not break system
-                return true;
-            }
-
-            DWORD pid = it->second;
-            (void)GetPriority_NoLock(pid);
-
-            // account traffic
-            if (addr.Outbound) traffic_[pid].uploadBytes += recvLen;
-            else traffic_[pid].downloadBytes += recvLen;
-
-            // apply per PID token bucket if this PID has a bucket (set via priority)
-            auto itB = pidBuckets_.find(pid);
-            if (itB == pidBuckets_.end())
-            {
-                // if PID has no explicit bucket, allow (unlimited)
-                return true;
-            }
-
-            // limiter lives in map -> must be used under lock
-            bool ok = itB->second.AllowBytes(recvLen);
-            return ok;
+            ConnKey localOnly = key;
+            localOnly.remoteAddr.fill(0);
+            localOnly.remotePort = 0;
+            it = connToPid_.find(localOnly);
         }
+        if (it == connToPid_.end())
+            return true;
+
+        DWORD pid = it->second;
+
+        // count traffic always
+        if (addr.Outbound) traffic_[pid].uploadBytes += recvLen;
+        else traffic_[pid].downloadBytes += recvLen;
+
+        // TeamViewer bypass: never limit its packets (in DIVERT mode too)
+        auto itName = pidToName_.find(pid);
+        if (itName != pidToName_.end() && IsTeamViewerProcessName(itName->second))
+        {
+            bool expected = false;
+            if (g_teamViewerBypassLogged.compare_exchange_strong(expected, true))
+            {
+                LOGW("TeamViewer erkannt: Pakete werden NICHT gefiltert/limitiert, "
+                    "weil Remote-Verbindung sonst abbrechen kann (gleiche Netzwerkschnittstelle).");
+            }
+            return true;
+        }
+
+        // if limiter disabled => always allow
+        if (!g_limiterEnabled.load())
+            return true;
+
+        // limiter ON:
+        // - if pid has explicit prio => use it
+        // - else => treat as LOW (throttle everyone else)
+        PriorityLevel lvl = PriorityLevel::Low;
+        auto itP = pidPriority_.find(pid);
+        if (itP != pidPriority_.end())
+            lvl = itP->second;
+
+        if (lvl == PriorityLevel::Unspecified)
+            lvl = PriorityLevel::Low;
+
+        double cap = GetProfileMaxKBps_NoLock(lvl);
+
+        auto itB = pidBuckets_.find(pid);
+        if (itB == pidBuckets_.end())
+        {
+            TokenBucket b{};
+            b.Reset(cap);
+            pidBuckets_[pid] = b;
+            itB = pidBuckets_.find(pid);
+        }
+        else
+        {
+            if (itB->second.maxKBps != cap)
+                itB->second.Reset(cap);
+        }
+
+        return itB->second.AllowBytes(recvLen);
     }
 };
 
@@ -711,11 +1106,12 @@ static void HandleJsonCommand(const std::string& line)
     json j = json::parse(line, nullptr, false);
     if (j.is_discarded())
     {
-        std::cerr << "JSON parse error\n";
+        LOGW("JSON parse error (discarded). Line=" + line);
         return;
     }
 
     std::string type = j.value("type", "");
+
     if (type == "SET_PROFILES")
     {
         auto profs = j["profiles"];
@@ -726,18 +1122,50 @@ static void HandleJsonCommand(const std::string& line)
         g_monitor->SetPriorityProfile(PriorityLevel::High, 0.0, highMax);
         g_monitor->SetPriorityProfile(PriorityLevel::Medium, 0.0, medMax);
         g_monitor->SetPriorityProfile(PriorityLevel::Low, 0.0, lowMax);
-        std::cout << "SET_PROFILES ok\n";
+        LOGI("SET_PROFILES ok");
     }
     else if (type == "SET_PRIORITIES")
     {
+        if (!j.contains("priorities") || !j["priorities"].is_array())
+        {
+            LOGW("SET_PRIORITIES missing/invalid 'priorities' array");
+            return;
+        }
+
+        // If the list contains NO real priority (1..3), disable limiter (=> sniff).
+        bool anyReal = false;
+        for (auto& item : j["priorities"])
+        {
+            int lvlInt = item.value("level", 99);
+            if (lvlInt == 1 || lvlInt == 2 || lvlInt == 3)
+            {
+                anyReal = true;
+                break;
+            }
+        }
+
+        if (!anyReal)
+        {
+            g_monitor->ClearAllPriorities_DisableLimiter();
+            LOGI("SET_PRIORITIES: no real priorities -> limiter OFF (sniff)");
+            return;
+        }
+
+        // Real priorities exist -> apply and enable limiter
         for (auto& item : j["priorities"])
         {
             DWORD pid = item.value("pid", 0u);
             int lvlInt = item.value("level", 99);
             PriorityLevel lvl = (PriorityLevel)lvlInt;
-            g_monitor->SetPriority(pid, lvl);
+            if (pid != 0)
+                g_monitor->SetPriority(pid, lvl);
         }
-        std::cout << "SET_PRIORITIES ok\n";
+
+        LOGI("SET_PRIORITIES ok (limiter ON => divert)");
+    }
+    else
+    {
+        LOGW("Unknown command type: " + type);
     }
 }
 
@@ -746,13 +1174,20 @@ static void HandleJsonCommand(const std::string& line)
 // ------------------------------------------------------------
 static void HandleClientCommands(SOCKET client)
 {
+    LOGI("HandleClientCommands thread start");
     char buffer[4096];
     std::string pending;
 
     while (g_running)
     {
         int n = recv(client, buffer, sizeof(buffer), 0);
-        if (n <= 0) break;
+        if (n == 0) { LOGI("Client closed connection (recv=0)"); break; }
+        if (n < 0)
+        {
+            int wsa = WSAGetLastError();
+            LOGW("recv() failed. WSA=" + std::to_string(wsa));
+            break;
+        }
 
         pending.append(buffer, n);
         size_t pos;
@@ -760,43 +1195,62 @@ static void HandleClientCommands(SOCKET client)
         {
             std::string line = pending.substr(0, pos);
             pending.erase(0, pos + 1);
-            if (!line.empty()) HandleJsonCommand(line);
+            if (!line.empty())
+            {
+                try { HandleJsonCommand(line); }
+                catch (const SehException& se)
+                {
+                    std::ostringstream oss;
+                    oss << "SEH exception handling command: code=0x" << std::hex << se.code
+                        << " addr=" << se.address;
+                    LOGE(oss.str());
+                }
+                catch (const std::exception& e) { LOGE(std::string("Exception handling command: ") + e.what()); }
+                catch (...) { LOGE("Unknown exception handling command"); }
+            }
         }
     }
 
     closesocket(client);
+
     {
-        std::lock_guard<std::mutex> lock(g_clientMutex);
+        SrwExclusiveGuard g(g_clientLock);
         if (g_clientSocket == client) g_clientSocket = INVALID_SOCKET;
     }
-    std::cout << "GUI disconnected\n";
+
+    LOGI("GUI disconnected");
 }
 
 static void ServerThreadFunc()
 {
+    LOGI("ServerThreadFunc start");
+
     WSADATA wsa{};
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
     {
-        std::cerr << "WSAStartup failed\n";
+        int wsae = WSAGetLastError();
+        LOGE("WSAStartup failed. WSA=" + std::to_string(wsae));
         return;
     }
 
     SOCKET listenSock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (listenSock == INVALID_SOCKET)
     {
-        std::cerr << "socket() failed\n";
+        int wsae = WSAGetLastError();
+        LOGE("socket() failed. WSA=" + std::to_string(wsae));
         WSACleanup();
         return;
     }
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK); // 127.0.0.1
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(5555);
 
     if (bind(listenSock, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
     {
-        std::cerr << "bind() failed\n";
+        int wsae = WSAGetLastError();
+        LOGE("bind() failed. WSA=" + std::to_string(wsae) + " (Port 5555 already in use?)");
         closesocket(listenSock);
         WSACleanup();
         return;
@@ -804,13 +1258,14 @@ static void ServerThreadFunc()
 
     if (listen(listenSock, 1) == SOCKET_ERROR)
     {
-        std::cerr << "listen() failed\n";
+        int wsae = WSAGetLastError();
+        LOGE("listen() failed. WSA=" + std::to_string(wsae));
         closesocket(listenSock);
         WSACleanup();
         return;
     }
 
-    std::cout << "TCP server listening on 127.0.0.1:5555\n";
+    LOGI("TCP server listening on 127.0.0.1:5555");
 
     while (g_running)
     {
@@ -818,26 +1273,28 @@ static void ServerThreadFunc()
         if (client == INVALID_SOCKET)
         {
             if (!g_running) break;
-            std::cerr << "accept() failed\n";
+            int wsae = WSAGetLastError();
+            LOGW("accept() failed. WSA=" + std::to_string(wsae));
             continue;
         }
 
         {
-            std::lock_guard<std::mutex> lock(g_clientMutex);
-            // replace old client if any
+            SrwExclusiveGuard g(g_clientLock);
             if (g_clientSocket != INVALID_SOCKET)
             {
+                LOGW("Replacing existing GUI client socket");
                 closesocket(g_clientSocket);
             }
             g_clientSocket = client;
         }
 
-        std::cout << "GUI connected\n";
+        LOGI("GUI connected");
         std::thread(HandleClientCommands, client).detach();
     }
 
     closesocket(listenSock);
     WSACleanup();
+    LOGW("ServerThreadFunc end");
 }
 
 // ------------------------------------------------------------
@@ -845,13 +1302,20 @@ static void ServerThreadFunc()
 // ------------------------------------------------------------
 static void StatsThreadFunc()
 {
-    // ✅ 1 Punkt = 1 Sekunde fürs Frontend (Zeitachse)
     constexpr int intervalMs = 1000;
+    LOGI("StatsThreadFunc start (intervalMs=1000)");
+
     while (g_running)
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(intervalMs));
-        if (g_monitor) g_monitor->PublishStats(intervalMs);
+        if (g_monitor)
+        {
+            try { g_monitor->PublishStats(intervalMs); }
+            catch (...) { LOGE("PublishStats unknown exception"); }
+        }
     }
+
+    LOGW("StatsThreadFunc end");
 }
 
 // ------------------------------------------------------------
@@ -859,30 +1323,81 @@ static void StatsThreadFunc()
 // ------------------------------------------------------------
 int main()
 {
-    // start GUI server
-    std::thread serverThread(ServerThreadFunc);
+    PauseAlways();
 
-    TrafficMonitor monitor;
-    g_monitor = &monitor;
+    g_logFile.open("netprio_backend.log", std::ios::out | std::ios::app);
 
-    if (!monitor.Init())
+    LOGI("============================================================");
+    LOGI("NetPrioBackend starting...");
+
+    SetUnhandledExceptionFilter(UnhandledExceptionFilterFunc);
+    _set_se_translator(SehTranslator);
+
     {
-        g_running = false;
-        if (serverThread.joinable()) serverThread.join();
-        return 1;
+        char cwd[MAX_PATH]{};
+        GetCurrentDirectoryA(MAX_PATH, cwd);
+        LOGI(std::string("CWD=") + cwd);
     }
 
-    // start stats publisher
-    std::thread statsThread(StatsThreadFunc);
+    std::thread serverThread;
+    std::thread statsThread;
 
-    // capture loop (blocking)
-    monitor.RunCaptureLoop();
+    try
+    {
+        serverThread = std::thread(ServerThreadFunc);
 
-    g_running = false;
-    monitor.Shutdown();
+        TrafficMonitor monitor;
+        g_monitor = &monitor;
 
-    if (statsThread.joinable()) statsThread.join();
-    if (serverThread.joinable()) serverThread.join();
+        if (!monitor.Init())
+        {
+            LOGE("monitor.Init() failed -> terminating.");
+            g_running = false;
+            if (serverThread.joinable()) serverThread.join();
+            return PauseAndReturn(1);
+        }
 
-    return 0;
+        statsThread = std::thread(StatsThreadFunc);
+
+        LOGI("Backend READY. Entering capture loop...");
+        monitor.RunCaptureLoop();
+
+        LOGW("Capture loop returned (unexpected unless stopping).");
+        g_running = false;
+        monitor.Shutdown();
+
+        if (statsThread.joinable()) statsThread.join();
+        if (serverThread.joinable()) serverThread.join();
+
+        LOGI("Normal shutdown complete.");
+        return PauseAndReturn(0);
+    }
+    catch (const SehException& se)
+    {
+        std::ostringstream oss;
+        oss << "SEH exception in main: code=0x" << std::hex << se.code
+            << " addr=" << se.address;
+        LOGE(oss.str());
+
+        g_running = false;
+        if (statsThread.joinable()) statsThread.join();
+        if (serverThread.joinable()) serverThread.join();
+        return PauseAndReturn(999);
+    }
+    catch (const std::exception& e)
+    {
+        LOGE(std::string("std::exception in main: ") + e.what());
+        g_running = false;
+        if (statsThread.joinable()) statsThread.join();
+        if (serverThread.joinable()) serverThread.join();
+        return PauseAndReturn(998);
+    }
+    catch (...)
+    {
+        LOGE("Unknown exception in main");
+        g_running = false;
+        if (statsThread.joinable()) statsThread.join();
+        if (serverThread.joinable()) serverThread.join();
+        return PauseAndReturn(997);
+    }
 }

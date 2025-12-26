@@ -106,6 +106,7 @@
       <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>C:\Users\weber\Desktop\NetPrio\NetPrio\NetPrio\external\WinDivert\include;C:\Users\Administrator\Desktop\NetPrio\NetPrio\external\nlohmann;C:\Users\Administrator\Desktop\NetPrio\NetPrio\external\WinDivert\include;C:\Users\weber\Desktop\NetPrio\NetPrio\NetPrio\external\nlohmann;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -124,6 +125,7 @@
       <ConformanceMode>true</ConformanceMode>
       <AdditionalIncludeDirectories>C:\Users\weber\Desktop\NetPrio\NetPrio\NetPrio\external\WinDivert\include;C:\Users\Administrator\Desktop\NetPrio\NetPrio\external\nlohmann;C:\Users\Administrator\Desktop\NetPrio\NetPrio\external\WinDivert\include;C:\Users\weber\Desktop\NetPrio\NetPrio\NetPrio\external\nlohmann;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <Optimization>Disabled</Optimization>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
